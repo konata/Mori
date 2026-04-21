@@ -1,4 +1,3 @@
-import java.nio.file.FileVisitOption
 import java.nio.file.Files
 import java.nio.file.Paths
 import java.util.jar.JarFile
@@ -25,23 +24,12 @@ kotlin {
   jvmToolchain(17)
 }
 
-List<File> dirOf(File base, String pattern, String exclude, int depth) {
-  base.listFiles()?.collectMany { File f ->
-    switch (true) {
-      case (depth < 0 || (exclude != null && f.name ==~ exclude)): return []
-      case (pattern != null && f.name ==~ pattern && f.isDirectory()): return [f]
-      case (f.isDirectory() && pattern != null): return dirOf(f, pattern, exclude, depth - 1)
-      default: return []
-    }
-  }
-}
-
-List<File> predictionOf(File base, int depth, Closure<Boolean> prediction) {
+List<File> dirOf(File base, int depth, Closure<Boolean> predicate) {
   (base.listFiles()?.collectMany { File f ->
     if (depth < 0) [] else {
-      switch (prediction(f)) {
+      switch (predicate(f)) {
         case true: return [f]
-        case false: return predictionOf(f, depth - 1, prediction)
+        case false: return dirOf(f, depth - 1, predicate)
         default: return [] as List<File>
       }
     }
@@ -53,19 +41,18 @@ sourceSets {
     // For cases like Connectivity mainline module, where jarjar renames service code
     // by adding the prefix "android.net.connectivity.*", we add a relocate sources dir manually and adjust
     // package declarations to match the JAR artifact.
-    // java.srcDirs = dirOf(file('externals'), /src|java|relocated/, /(?i).*(test|lint).*/, 4) ?: []
 
     def (excludes, names, paths) = [[/(?i)(test|lint)/],
                                     [/src|java|relocated/],
                                     [$/staticlibs/(device|framework)/$, $/telephony/common/$]]
 
-    java.srcDirs = (files("${project.rootDir}/build/generated/stubs") + predictionOf(file('externals'), 4) { File f ->
+    java.srcDirs = files("${project.rootDir}/build/generated/stubs") + dirOf(file('externals'), 4) { File f ->
       switch (true) {
         case excludes.any(f.name::find) || !f.isDirectory(): return null
         case (names.any(f.name::matches) || paths.any(f.path::find)) && f.isDirectory(): return true
         default: return false
       }
-    }).tap { println("source dir counts: ${it.size()}") }
+    }
   }
 }
 
