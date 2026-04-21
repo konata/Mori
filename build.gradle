@@ -1,0 +1,164 @@
+import java.nio.file.FileVisitOption
+import java.nio.file.Files
+import java.nio.file.Paths
+import java.util.jar.JarFile
+
+plugins {
+  id 'java'
+  id 'org.jetbrains.kotlin.jvm'
+}
+
+group = 'org.example'
+version = '1.0-SNAPSHOT'
+def baseBranch = "git -C ${rootDir}/../base branch --show-current".execute().text.trim()
+def platformVersion = new File("${rootDir}/../base/core/java/android/os/Build.java").text
+  .findAll(/public static final int \w+ = (\d+);/) { _, n -> n as int }
+  .findAll { it < 100 }.max()
+
+
+repositories {
+  google()
+  mavenCentral()
+}
+
+kotlin {
+  jvmToolchain(17)
+}
+
+List<File> dirOf(File base, String pattern, String exclude, int depth) {
+  base.listFiles()?.collectMany { File f ->
+    switch (true) {
+      case (depth < 0 || (exclude != null && f.name ==~ exclude)): return []
+      case (pattern != null && f.name ==~ pattern && f.isDirectory()): return [f]
+      case (f.isDirectory() && pattern != null): return dirOf(f, pattern, exclude, depth - 1)
+      default: return []
+    }
+  }
+}
+
+List<File> predictionOf(File base, int depth, Closure<Boolean> prediction) {
+  (base.listFiles()?.collectMany { File f ->
+    if (depth < 0) [] else {
+      switch (prediction(f)) {
+        case true: return [f]
+        case false: return predictionOf(f, depth - 1, prediction)
+        default: return [] as List<File>
+      }
+    }
+  } ?: [])
+}
+
+sourceSets {
+  main {
+    // For cases like Connectivity mainline module, where jarjar renames service code
+    // by adding the prefix "android.net.connectivity.*", we add a relocate sources dir manually and adjust
+    // package declarations to match the JAR artifact.
+    // java.srcDirs = dirOf(file('externals'), /src|java|relocated/, /(?i).*(test|lint).*/, 4) ?: []
+
+    def (excludes, names, paths) = [[/(?i)(test|lint)/],
+                                    [/src|java|relocated/],
+                                    [$/staticlibs/(device|framework)/$, $/telephony/common/$]]
+
+    java.srcDirs = (files("${project.rootDir}/build/generated/stubs") + predictionOf(file('externals'), 4) { File f ->
+      switch (true) {
+        case excludes.any(f.name::find) || !f.isDirectory(): return null
+        case (names.any(f.name::matches) || paths.any(f.path::find)) && f.isDirectory(): return true
+        default: return false
+      }
+    }).tap { println("source dir counts: ${it.size()}") }
+  }
+}
+
+dependencies {
+  implementation files("${System.getenv("ANDROID_HOME")}/platforms/android-${platformVersion}/android.unsealed.jar")
+  testImplementation platform('org.junit:junit-bom:5.9.1')
+  testImplementation 'org.junit.jupiter:junit-jupiter'
+  implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk8"
+}
+
+test {
+  useJUnitPlatform()
+}
+
+task stubify() {
+  doLast {
+    def output = Files.createDirectories(layout.buildDirectory.dir("generated/stubs").get().asFile.toPath())
+    def existing = new HashSet(
+      Collections.list(new JarFile(file("${System.getenv('ANDROID_HOME')}/platforms/android-${platformVersion}/android.unsealed.jar")).entries()).collect { it.name.find(/^.*(?=\.class$)/)?.replace('/', '.') } +
+        sourceSets.main.java.srcDirs.collectMany { dir -> fileTree(dir) { include "**/*.java", "**/*.kt" }.collect { dir.toPath().relativize(it.toPath()).toString().replaceAll(/\.(java|kt)$/, "").replace('/', ".") } }
+    )
+    fileTree("${project.rootDir}/externals") {
+      include '**/*.aidl'
+      exclude { it.path =~ /(?i)(^|\/)[^\/]*(test|lint|fuzz)[^\/]*(\/|$)/ }
+    }.forEach { aidl ->
+      def pkg = (aidl.text =~ /(?m)^\s*package\s+([\w.]+)\s*;/)?.getAt(0)?.getAt(1)
+      pkg && (aidl.text =~ /(?m)^\s*(?:oneway\s+)?(interface|parcelable)\s+(\w+)\s*[;{]/)
+        .findAll { _, type, name -> "$pkg.$name".toString() !in existing }
+        .each { _, type, name ->
+          def gen = output.resolve(pkg.replace('.', '/') + "/${name}.java")
+          Files.createDirectories(gen.parent)
+          gen.text = (type == 'interface') ? """\
+            |package $pkg;
+            |public interface $name extends android.os.IInterface {
+            |  abstract class Stub extends android.os.Binder implements $name {
+            |    public static $name asInterface(android.os.IBinder o) { return null; }
+            |    @Override public android.os.IBinder asBinder() { return this; }
+            |  }
+            |}
+            |""".stripMargin() :
+            """\
+            |package $pkg;
+            |public class $name implements android.os.Parcelable {
+            |  public int describeContents() { return 0; }
+            |  public void writeToParcel(android.os.Parcel p, int f) {}
+            |  public static final android.os.Parcelable.Creator<$name> CREATOR = null;
+            |}
+            |""".stripMargin()
+        }
+    }
+  }
+}
+
+task link() {
+  doLast {
+    // remove stained links contents
+    Files.list(Paths.get("${project.rootDir}/externals/")).findAll(Files.&isSymbolicLink).forEach {
+      System.err.println("🗑️: `$it`")
+      Files.deleteIfExists(it)
+    }
+
+    def modules = [base            : "https://android.googlesource.com/platform/frameworks/base",
+                   Bluetooth       : "https://android.googlesource.com/platform/packages/modules/Bluetooth",
+                   Permission      : "https://android.googlesource.com/platform/packages/modules/Permission",
+                   HealthFitness   : "https://android.googlesource.com/platform/packages/modules/HealthFitness",
+                   AdServices      : "https://android.googlesource.com/platform/packages/modules/AdServices",
+                   'modules-utils' : "https://android.googlesource.com/platform/frameworks/libs/modules-utils",
+                   Wifi            : "https://android.googlesource.com/platform/packages/modules/Wifi",
+                   Telecomm        : "https://android.googlesource.com/platform/packages/services/Telecomm",
+                   Connectivity    : "https://android.googlesource.com/platform/packages/modules/Connectivity",
+                   Mms             : "https://android.googlesource.com/platform/packages/services/Mms",
+                   Telephony       : "https://android.googlesource.com/platform/packages/services/Telephony",
+                   "opt/telephony" : "https://android.googlesource.com/platform/frameworks/opt/telephony",
+                   DownloadProvider: "https://android.googlesource.com/platform/packages/providers/DownloadProvider",]
+
+    // refresh relative links
+    modules.forEach { module, remote ->
+      def src = Paths.get("${project.rootDir}/../$module").toAbsolutePath()
+      def sink = Paths.get("${project.rootDir}/externals/${module.replaceAll("/", "@")}").toAbsolutePath()
+      if (!Files.exists(src)) {
+        println("""\n⚠️⚠️⚠️module **$module** does not exists
+          |possible fix:
+          |```
+          |git clone $remote $module
+          |cd $module
+          |git switch -c $baseBranch \$(git rev-parse $baseBranch)
+          |```""".stripMargin())
+      } else {
+        def branch = "git -C $src branch --show-current".execute().text.trim()
+        if (branch != baseBranch) System.err.println("⚠️: `$module` on `${branch ?: 'detached HEAD'}`, base is on `$baseBranch`")
+        println(Files.createSymbolicLink(sink, src))
+        println("🔗: `$src` to `$sink`")
+      }
+    }
+  }
+}
