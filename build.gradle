@@ -9,8 +9,8 @@ plugins {
 
 group = 'org.example'
 version = '1.0-SNAPSHOT'
-def baseBranch = "git -C ${rootDir}/../base branch --show-current".execute().text.trim()
-def platformVersion = new File("${rootDir}/../base/core/java/android/os/Build.java").text
+def branch = "git -C ${rootDir}/../base branch --show-current".execute().text.trim()
+def version = new File("${rootDir}/../base/core/java/android/os/Build.java").text
   .findAll(/public static final int \w+ = (\d+);/) { _, n -> n as int }
   .findAll { it < 100 }.max()
 
@@ -57,7 +57,7 @@ sourceSets {
 }
 
 dependencies {
-  implementation files("${System.getenv("ANDROID_HOME")}/platforms/android-${platformVersion}/android.unsealed.jar")
+  implementation files("${System.getenv("ANDROID_HOME")}/platforms/android-${version}/android.unsealed.jar")
   testImplementation platform('org.junit:junit-bom:5.9.1')
   testImplementation 'org.junit.jupiter:junit-jupiter'
   implementation "org.jetbrains.kotlin:kotlin-stdlib-jdk8"
@@ -71,7 +71,7 @@ task stubify() {
   doLast {
     def output = Files.createDirectories(layout.buildDirectory.dir("generated/stubs").get().asFile.toPath())
     def existing = new HashSet(
-      Collections.list(new JarFile(file("${System.getenv('ANDROID_HOME')}/platforms/android-${platformVersion}/android.unsealed.jar")).entries()).collect { it.name.find(/^.*(?=\.class$)/)?.replace('/', '.') } +
+      Collections.list(new JarFile(file("${System.getenv('ANDROID_HOME')}/platforms/android-${version}/android.unsealed.jar")).entries()).collect { it.name.find(/^.*(?=\.class$)/)?.replace('/', '.') } +
         sourceSets.main.java.srcDirs.collectMany { dir -> fileTree(dir) { include "**/*.java", "**/*.kt" }.collect { dir.toPath().relativize(it.toPath()).toString().replaceAll(/\.(java|kt)$/, "").replace('/', ".") } }
     )
     fileTree("${project.rootDir}/externals") {
@@ -138,11 +138,11 @@ task link() {
           |```
           |git clone $remote $module
           |cd $module
-          |git switch -c $baseBranch \$(git rev-parse $baseBranch)
+          |git switch -c $branch \$(git rev-parse $branch)
           |```""".stripMargin())
       } else {
-        def branch = "git -C $src branch --show-current".execute().text.trim()
-        if (branch != baseBranch) System.err.println("⚠️: `$module` on `${branch ?: 'detached HEAD'}`, base is on `$baseBranch`")
+        def tip = "git -C $src branch --show-current".execute().text.trim()
+        if (branch != tip) System.err.println("⚠️: `$module` on `${tip ?: 'detached HEAD'}`, base is on `$branch`")
         println(Files.createSymbolicLink(sink, src))
         println("🔗: `$src` to `$sink`")
       }
